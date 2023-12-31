@@ -38,14 +38,19 @@ func handleAuthRequest(moduleName string, w http.ResponseWriter, r *http.Request
 			continue
 		}
 
-		parsed, err := common.Base64DwcEncoding.DecodeString(values[0])
-		if err != nil {
-			logging.Error(moduleName, "Invalid POST form value:", aurora.Cyan(key).String()+":", aurora.Cyan(values[0]))
-			replyHTTPError(w, 400, "400 Bad Request")
-			return
-		}
-
-		value := string(parsed)
+        var value string
+        if !strings.HasPrefix(key, "_") {
+            parsed, err = common.Base64DwcEncoding.DecodeString(values[0])
+            if err != nil {
+                logging.Error(moduleName, "Invalid POST form value:", aurora.Cyan(key).String()+":", aurora.Cyan(values[0]))
+                replyHTTPError(w, 400, "400 Bad Request")
+                return
+            }
+            value = string(parsed)
+        } else {
+            // Values unique to CTGP/the Wiimmfi payload, for compatibility reasons. Some of these are not base64 encoded.
+            value = values[0]
+        }
 
 		if key == "ingamesn" {
 			// Special handling required for the UTF-16 string
