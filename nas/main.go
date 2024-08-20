@@ -2,57 +2,82 @@ package nas
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"wwfc/api"
 	"wwfc/common"
+	"wwfc/gamestats"
 	"wwfc/logging"
 	"wwfc/nhttp"
+	"wwfc/race"
 	"wwfc/sake"
 
-	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/logrusorgru/aurora/v3"
 )
 
 var (
-	ctx  = context.Background()
-	pool *pgxpool.Pool
+	serverName string
+	server     *nhttp.Server
 )
 
-func StartServer() {
+func StartServer(reload bool) {
 	// Get config
 	config := common.GetConfig()
 
-	// Start SQL
-	dbString := fmt.Sprintf("postgres://%s:%s@%s/%s", config.Username, config.Password, config.DatabaseAddress, config.DatabaseName)
-	dbConf, err := pgxpool.ParseConfig(dbString)
-	if err != nil {
-		panic(err)
-	}
+	serverName = config.ServerName
 
-	pool, err = pgxpool.ConnectConfig(ctx, dbConf)
-	if err != nil {
-		panic(err)
-	}
-
-	address := config.Address + ":" + config.Port
+	address := *config.NASAddress + ":" + config.NASPort
 
 	if config.EnableHTTPS {
-		go startHTTPSProxy(config.Address+":"+config.PortHTTPS, "localhost:"+config.Port)
+		go startHTTPSProxy(config)
 	}
 
-	logging.Notice("NAS", "Starting HTTP server on", address)
-	panic(nhttp.ListenAndServe(address, http.HandlerFunc(handleRequest)))
+	err := CacheProfanityFile()
+	if err != nil {
+		logging.Info("NAS", err)
+	}
+
+	server = &nhttp.Server{
+		Addr:        address,
+		Handler:     http.HandlerFunc(handleRequest),
+		IdleTimeout: 20 * time.Second,
+		ReadTimeout: 10 * time.Second,
+	}
+
+	go func() {
+		logging.Notice("NAS", "Starting HTTP server on", aurora.BrightCyan(address))
+
+		err := server.ListenAndServe()
+		if err != nil && !errors.Is(err, nhttp.ErrServerClosed) {
+			panic(err)
+		}
+	}()
 }
 
+func Shutdown() {
+	if server == nil {
+		return
+	}
+
+	ctx, release := context.WithTimeout(context.Background(), 10*time.Second)
+	defer release()
+
+	err := server.Shutdown(ctx)
+	if err != nil {
+		logging.Error("NAS", "Error on HTTP shutdown:", err)
+	}
+}
+
+var regexRaceHost = regexp.MustCompile(`^([a-z\-]+\.)?race\.gs\.`)
 var regexSakeHost = regexp.MustCompile(`^([a-z\-]+\.)?sake\.gs\.`)
+var regexGamestatsHost = regexp.MustCompile(`^([a-z\-]+\.)?gamestats2?\.gs\.`)
 var regexStage1URL = regexp.MustCompile(`^/w([0-9])$`)
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	// TODO: Move this to its own server
 	// Check for *.sake.gs.* or sake.gs.*
 	if regexSakeHost.MatchString(r.Host) {
 		// Redirect to the sake server
@@ -60,36 +85,44 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logging.Notice("NAS", aurora.Yellow(r.Method), aurora.Cyan(r.URL), "via", aurora.Cyan(r.Host), "from", aurora.BrightCyan(r.RemoteAddr))
+	// Check for *.gamestats(2).gs.* or gamestats(2).gs.*
+	if regexGamestatsHost.MatchString(r.Host) {
+		// Redirect to the gamestats server
+		gamestats.HandleWebRequest(w, r)
+		return
+	}
+
+	// Check for *.race.gs.* or race.gs.*
+	if regexRaceHost.MatchString(r.Host) {
+		// Redirect to the race server
+		race.HandleRequest(w, r)
+		return
+	}
+
 	moduleName := "NAS:" + r.RemoteAddr
 
+	// Handle conntest server
+	if strings.HasPrefix(r.Host, "conntest.") {
+		handleConnectionTest(w)
+		return
+	}
+
+	// Handle DWC auth requests
 	if r.URL.String() == "/ac" || r.URL.String() == "/pr" || r.URL.String() == "/download" {
 		handleAuthRequest(moduleName, w, r)
 		return
 	}
 
-	// TODO: Move this to its own server
+	// Handle /nastest.jsp
+	if r.URL.Path == "/nastest.jsp" {
+		handleNASTest(w)
+		return
+	}
+
 	// Check for /payload
-	if strings.HasPrefix(r.URL.String(), "/payload?") {
+	if strings.HasPrefix(r.URL.String(), "/payload") {
+		logging.Info("NAS", aurora.Yellow(r.Method), aurora.Cyan(r.URL), "via", aurora.Cyan(r.Host), "from", aurora.BrightCyan(r.RemoteAddr))
 		handlePayloadRequest(moduleName, w, r)
-		return
-	}
-
-	// Check for /online
-	if r.URL.String() == "/online" {
-		returnOnlineStats(w)
-		return
-	}
-
-	// Check for /api/groups
-	if r.URL.Path == "/api/groups" {
-		api.HandleGroups(w, r)
-		return
-	}
-
-	// Handle conntest server
-	if strings.HasPrefix(r.Host, "conntest.") {
-		handleConnectionTest(w)
 		return
 	}
 
@@ -100,24 +133,77 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			panic(err)
 		}
 
+		logging.Info("NAS", "Get stage 1:", aurora.Yellow(r.Method), aurora.Cyan(r.URL), "via", aurora.Cyan(r.Host), "from", aurora.BrightCyan(r.RemoteAddr))
 		downloadStage1(w, val)
 		return
 	}
 
+	// Check for /api/groups
+	if r.URL.Path == "/api/groups" {
+		api.HandleGroups(w, r)
+		return
+	}
+
+	// Check for /api/stats
+	if r.URL.Path == "/api/stats" {
+		api.HandleStats(w, r)
+		return
+	}
+
+	// Check for /api/ban
+	if r.URL.Path == "/api/ban" {
+		api.HandleBan(w, r)
+		return
+	}
+
+	// Check for /api/unban
+	if r.URL.Path == "/api/unban" {
+		api.HandleUnban(w, r)
+		return
+	}
+
+	// Check for /api/kick
+	if r.URL.Path == "/api/kick" {
+		api.HandleKick(w, r)
+		return
+	}
+
+	logging.Info("NAS", aurora.Yellow(r.Method), aurora.Cyan(r.URL), "via", aurora.Cyan(r.Host), "from", aurora.BrightCyan(r.RemoteAddr))
 	replyHTTPError(w, 404, "404 Not Found")
 }
 
 func replyHTTPError(w http.ResponseWriter, errorCode int, errorString string) {
-	response := "<html>\n"
-	response += "<head><title>" + errorString + "</title></head>\n"
-	response += "<body>\n"
-	response += "<center><h1>" + errorString + "</h1></center>\n"
-	response += "<hr><center>WiiLink</center>\n"
-	response += "</body>\n"
-	response += "</html>\n"
+	response := "<html>\n" +
+		"<head><title>" + errorString + "</title></head>\n" +
+		"<body>\n" +
+		"<center><h1>" + errorString + "</h1></center>\n" +
+		"<hr><center>" + serverName + "</center>\n" +
+		"</body>\n" +
+		"</html>\n"
 
 	w.Header().Set("Content-Type", "text/html")
 	w.Header().Set("Content-Length", strconv.Itoa(len(response)))
+	w.Header().Set("Connection", "close")
+	w.Header().Set("Server", "Nintendo")
 	w.WriteHeader(errorCode)
+	w.Write([]byte(response))
+}
+
+func handleNASTest(w http.ResponseWriter) {
+	response := "" +
+		"<html>\n" +
+		"<body>\n" +
+		"</br>AuthServer is up</br> \n" +
+		"\n" +
+		"</body>\n" +
+		"</html>\n"
+
+	w.Header().Set("Content-Type", "text/html;charset=ISO-8859-1")
+	w.Header().Set("Content-Length", strconv.Itoa(len(response)))
+	w.Header().Set("Connection", "close")
+	w.Header().Set("NODE", "authserver-service.authserver.svc.cluster.local")
+	w.Header().Set("Server", "Nintendo")
+
+	w.WriteHeader(200)
 	w.Write([]byte(response))
 }

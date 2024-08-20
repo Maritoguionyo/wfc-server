@@ -3,7 +3,6 @@ package sake
 import (
 	"encoding/base64"
 	"encoding/xml"
-	"github.com/logrusorgru/aurora/v3"
 	"io"
 	"net/http"
 	"regexp"
@@ -12,6 +11,8 @@ import (
 	"wwfc/common"
 	"wwfc/database"
 	"wwfc/logging"
+
+	"github.com/logrusorgru/aurora/v3"
 )
 
 const (
@@ -140,25 +141,21 @@ func handleStorageRequest(moduleName string, w http.ResponseWriter, r *http.Requ
 
 	xmlName := soap.Body.Data.XMLName.Space + "/" + soap.Body.Data.XMLName.Local
 	if headerAction == xmlName || headerAction == `"`+xmlName+`"` {
-		logging.Notice(moduleName, "SOAPAction:", aurora.Yellow(soap.Body.Data.XMLName.Local))
+		logging.Info(moduleName, "SOAPAction:", aurora.Yellow(soap.Body.Data.XMLName.Local))
 
 		if profileId, gameInfo, ok := getRequestIdentity(moduleName, soap.Body.Data); ok {
 			switch xmlName {
 			case SakeNamespace + "/GetMyRecords":
 				response.Body.GetMyRecordsResponse = getMyRecords(moduleName, profileId, gameInfo, soap.Body.Data)
-				break
 
 			case SakeNamespace + "/UpdateRecord":
 				response.Body.UpdateRecordResponse = updateRecord(moduleName, profileId, gameInfo, soap.Body.Data)
-				break
 
 			case SakeNamespace + "/SearchForRecords":
 				response.Body.SearchForRecordsResponse = searchForRecords(moduleName, gameInfo, soap.Body.Data)
-				break
 
 			default:
 				logging.Error(moduleName, "Unknown SOAPAction:", aurora.Cyan(xmlName))
-				break
 			}
 		}
 	} else {
@@ -189,7 +186,7 @@ func getRequestIdentity(moduleName string, request StorageRequestData) (uint32, 
 		return 0, common.GameInfo{}, false
 	}
 
-	err, profileId, _ := common.UnmarshalGPCMLoginTicket(request.LoginTicket)
+	profileId, _, err := common.UnmarshalGPCMLoginTicket(request.LoginTicket)
 	if err != nil {
 		logging.Error(moduleName, err)
 		return 0, common.GameInfo{}, false
@@ -236,11 +233,14 @@ func getMyRecords(moduleName string, profileId uint32, gameInfo common.GameInfo,
 		GetMyRecordsResult: "Error",
 	}
 
-	values := map[string]StorageValue{}
+	var values map[string]StorageValue
 
 	switch gameInfo.Name + "/" + request.TableID {
 	default:
 		logging.Error(moduleName, "Unknown table")
+		for _, field := range request.Fields.Fields {
+			logging.Info(moduleName, "Field:", aurora.Cyan(field))
+		}
 		return &errorResponse
 
 	case "mariokartwii/FriendInfo":
@@ -250,7 +250,6 @@ func getMyRecords(moduleName string, profileId uint32, gameInfo common.GameInfo,
 			"recordid": intValue(int32(profileId)),
 			"info":     binaryDataValueBase64(database.GetMKWFriendInfo(pool, ctx, profileId)),
 		}
-		break
 	}
 
 	response := StorageGetMyRecordsResponse{
@@ -268,7 +267,7 @@ func getMyRecords(moduleName string, profileId uint32, gameInfo common.GameInfo,
 		}
 	}
 
-	logging.Notice(moduleName, "Wrote", aurora.Cyan(fieldCount), "field(s)")
+	logging.Info(moduleName, "Wrote", aurora.Cyan(fieldCount), "field(s)")
 	return &response
 }
 
@@ -280,6 +279,9 @@ func updateRecord(moduleName string, profileId uint32, gameInfo common.GameInfo,
 	switch gameInfo.Name + "/" + request.TableID {
 	default:
 		logging.Error(moduleName, "Unknown table")
+		for _, field := range request.Values.RecordFields {
+			logging.Info(moduleName, "Field:", aurora.Cyan(field.Name), "Type:", aurora.Cyan(field.Value.XMLName.Local), "Value:", aurora.Cyan(field.Value.Value.Value))
+		}
 		return &errorResponse
 
 	case "mariokartwii/FriendInfo":
@@ -292,7 +294,6 @@ func updateRecord(moduleName string, profileId uint32, gameInfo common.GameInfo,
 		// TODO: Validate record data
 		database.UpdateMKWFriendInfo(pool, ctx, profileId, request.Values.RecordFields[0].Value.Value.Value)
 		logging.Notice(moduleName, "Updated Mario Kart Wii friend info")
-		break
 	}
 
 	return &StorageUpdateRecordResponse{
@@ -310,6 +311,9 @@ func searchForRecords(moduleName string, gameInfo common.GameInfo, request Stora
 	switch gameInfo.Name + "/" + request.TableID {
 	default:
 		logging.Error(moduleName, "Unknown table")
+		for _, field := range request.Fields.Fields {
+			logging.Info(moduleName, "Field:", aurora.Cyan(field))
+		}
 		return &errorResponse
 
 	case "mariokartwii/FriendInfo":
@@ -326,8 +330,6 @@ func searchForRecords(moduleName string, gameInfo common.GameInfo, request Stora
 			return &errorResponse
 		}
 
-		// TODO: Check if the two are friends maybe
-
 		values = []map[string]StorageValue{
 			{
 				"ownerid":  uintValue(uint32(ownerId)),
@@ -335,14 +337,13 @@ func searchForRecords(moduleName string, gameInfo common.GameInfo, request Stora
 				"info":     binaryDataValueBase64(database.GetMKWFriendInfo(pool, ctx, uint32(ownerId))),
 			},
 		}
-		break
 	}
 
 	// Sort the values now
 	sort.Slice(values, func(l, r int) bool {
 		lVal, lExists := values[l][request.Sort]
 		rVal, rExists := values[r][request.Sort]
-		if lExists == false || rExists == false {
+		if !lExists || !rExists {
 			// Prioritises the one that exists or goes left if both false
 			return rExists
 		}
@@ -382,6 +383,6 @@ func searchForRecords(moduleName string, gameInfo common.GameInfo, request Stora
 		}
 	}
 
-	logging.Notice(moduleName, "Wrote", aurora.BrightCyan(fieldCount), "field(s) across", aurora.BrightCyan(i), "record(s)")
+	logging.Info(moduleName, "Wrote", aurora.BrightCyan(fieldCount), "field(s) across", aurora.BrightCyan(i), "record(s)")
 	return &response
 }

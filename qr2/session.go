@@ -1,8 +1,10 @@
 package qr2
 
 import (
+	"encoding/gob"
 	"math/rand"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -11,28 +13,33 @@ import (
 
 	"github.com/logrusorgru/aurora/v3"
 	"github.com/sasha-s/go-deadlock"
+	"gvisor.dev/gvisor/pkg/sleep"
 )
 
 const (
-	ClientNoEndian = iota
-	ClientBigEndian
-	ClientLittleEndian
+	ClientLittleEndian = 0
+	ClientBigEndian    = 1
+	ClientNoEndian     = 2
 )
 
 type Session struct {
 	SessionID       uint32
 	SearchID        uint64
-	Addr            net.Addr
+	Addr            net.UDPAddr
 	Challenge       string
 	Authenticated   bool
-	Login           *LoginInfo
+	login           *LoginInfo
 	ExploitReceived bool
 	LastKeepAlive   int64
 	Endianness      byte // Some fields depend on the client's endianness
 	Data            map[string]string
 	PacketCount     uint32
+	Reservation     common.MatchCommandData
 	ReservationID   uint64
-	GroupPointer    *Group
+	messageMutex    *deadlock.Mutex
+	messageAckWaker *sleep.Waker
+	groupPointer    *Group
+	GroupName       string
 }
 
 var (
@@ -41,37 +48,59 @@ var (
 	mutex             = deadlock.Mutex{}
 )
 
-// Remove a session.
+// Remove a session. Expects the global mutex to already be locked.
 func removeSession(addr uint64) {
 	session := sessions[addr]
 	if session == nil {
 		return
 	}
 
-	if session.GroupPointer != nil {
-		delete(session.GroupPointer.Players, session)
+	session.messageAckWaker.Assert()
 
-		if len(session.GroupPointer.Players) == 0 {
-			logging.Notice("QR2", "Deleting group", aurora.Cyan(session.GroupPointer.GroupName))
-			delete(groups, session.GroupPointer.GroupName)
-		} else if session.GroupPointer.Server == session {
-			logging.Notice("QR2", "Server down in group", aurora.Cyan(session.GroupPointer.GroupName))
-			session.GroupPointer.Server = nil
-			// TODO: Search for new host via dwc_hoststate
-		}
-
-		session.GroupPointer = nil
+	if session.groupPointer != nil {
+		session.removeFromGroup()
 	}
 
-	if session.Login != nil {
-		session.Login.Session = nil
-		session.Login = nil
+	if session.login != nil {
+		session.login.session = nil
+		session.login = nil
 	}
 
 	// Delete search ID lookup
 	delete(sessionBySearchID, sessions[addr].SearchID)
 
 	delete(sessions, addr)
+}
+
+// Remove session from group. Expects the global mutex to already be locked.
+func (session *Session) removeFromGroup() {
+	if session.groupPointer == nil {
+		return
+	}
+
+	delete(session.groupPointer.players, session)
+
+	if len(session.groupPointer.players) == 0 {
+		logging.Notice("QR2", "Deleting group", aurora.Cyan(session.groupPointer.GroupName))
+		delete(groups, session.groupPointer.GroupName)
+	} else if session.groupPointer.server == session {
+		logging.Notice("QR2", "Server down in group", aurora.Cyan(session.groupPointer.GroupName))
+		session.groupPointer.server = nil
+		session.groupPointer.findNewServer()
+	}
+
+	for player := range session.groupPointer.players {
+		delete(player.Data, "+conn_"+session.Data["+joinindex"])
+	}
+
+	for field := range session.Data {
+		if strings.HasPrefix(field, "+conn_") {
+			delete(session.Data, field)
+		}
+	}
+
+	session.groupPointer = nil
+	session.GroupName = ""
 }
 
 // Update session data, creating the session if it doesn't exist. Returns a copy of the session data.
@@ -93,24 +122,27 @@ func setSessionData(moduleName string, addr net.Addr, sessionId uint32, payload 
 
 	if !sessionExists {
 		session = &Session{
-			SessionID:     sessionId,
-			Addr:          addr,
-			Challenge:     "",
-			Authenticated: false,
-			LastKeepAlive: time.Now().Unix(),
-			Endianness:    ClientNoEndian,
-			Data:          payload,
-			PacketCount:   0,
-			ReservationID: 0,
+			SessionID:       sessionId,
+			Addr:            *addr.(*net.UDPAddr),
+			Challenge:       "",
+			Authenticated:   false,
+			LastKeepAlive:   time.Now().Unix(),
+			Endianness:      ClientNoEndian,
+			Data:            payload,
+			PacketCount:     0,
+			Reservation:     common.MatchCommandData{},
+			ReservationID:   0,
+			messageMutex:    &deadlock.Mutex{},
+			messageAckWaker: &sleep.Waker{},
 		}
 	}
 
-	if newPIDValid && !session.setProfileID(moduleName, newPID) {
+	if newPIDValid && !session.setProfileID(moduleName, newPID, "") {
 		return Session{}, false
 	}
 
 	if !sessionExists {
-		logging.Notice(moduleName, "Creating session", aurora.Cyan(sessionId).String())
+		logging.Info(moduleName, "Creating session", aurora.Cyan(sessionId).String())
 
 		// Set search ID
 		for {
@@ -143,7 +175,7 @@ func setSessionData(moduleName string, addr net.Addr, sessionId uint32, payload 
 // Set the session's profile ID if it doesn't already exists.
 // Returns false if the profile ID is invalid.
 // Expects the global mutex to already be locked.
-func (session *Session) setProfileID(moduleName string, newPID string) bool {
+func (session *Session) setProfileID(moduleName string, newPID string, gpcmIP string) bool {
 	if oldPID, oldPIDValid := session.Data["dwc_pid"]; oldPIDValid && oldPID != "" {
 		if newPID != oldPID {
 			logging.Error(moduleName, "New dwc_pid mismatch: new:", aurora.Cyan(newPID), "old:", aurora.Cyan(oldPID))
@@ -165,32 +197,45 @@ func (session *Session) setProfileID(moduleName string, newPID string) bool {
 	var loginInfo *LoginInfo
 	var ok bool
 	if loginInfo, ok = logins[uint32(profileID)]; ok {
-		gpPublicIP = loginInfo.GPPublicIP
+		gpPublicIP = strings.Split(loginInfo.GPPublicIP, ":")[0]
 	} else {
 		logging.Error(moduleName, "Provided dwc_pid is not logged in:", aurora.Cyan(newPID))
 		return false
 	}
 
-	if strings.Split(gpPublicIP, ":")[0] != strings.Split(session.Addr.String(), ":")[0] {
-		logging.Error(moduleName, "Caller public IP does not match GPCM session")
+	// TODO: Some kind of authentication
+	if gpcmIP != "" && gpcmIP != gpPublicIP {
+		logging.Error(moduleName, "TCP public IP mismatch: SB:", aurora.Cyan(gpcmIP), "GP:", aurora.Cyan(gpPublicIP))
 		return false
 	}
 
-	session.Login = loginInfo
+	if ratingError := checkValidRating(moduleName, session.Data); ratingError != "ok" {
+		profileId := loginInfo.ProfileID
 
-	// Constraint: only one session can exist with a given profile ID
-	if loginInfo.Session != nil {
-		logging.Notice(moduleName, "Removing outdated session", aurora.BrightCyan(loginInfo.Session.Addr.String()), "with PID", aurora.Cyan(newPID))
-		removeSession(makeLookupAddr(loginInfo.Session.Addr.String()))
+		mutex.Unlock()
+		gpErrorCallback(profileId, ratingError)
+		mutex.Lock()
+		return false
 	}
 
-	loginInfo.Session = session
+	session.login = loginInfo
+
+	// Constraint: only one session can exist with a given profile ID
+	if loginInfo.session != nil {
+		logging.Notice(moduleName, "Removing outdated session", aurora.BrightCyan(loginInfo.session.Addr.String()), "with PID", aurora.Cyan(newPID))
+		removeSession(makeLookupAddr(loginInfo.session.Addr.String()))
+	}
+
+	loginInfo.session = session
 
 	if loginInfo.DeviceAuthenticated {
 		session.Data["+deviceauth"] = "1"
 	} else {
 		session.Data["+deviceauth"] = "0"
 	}
+
+	session.Data["+gppublicip"], _ = common.IPFormatToString(gpPublicIP)
+	session.Data["+fcgameid"] = loginInfo.FriendKeyGame
 
 	session.Data["dwc_pid"] = newPID
 	logging.Notice(moduleName, "Opened session with PID", aurora.Cyan(newPID))
@@ -246,4 +291,45 @@ func GetSearchID(addr uint64) uint64 {
 	}
 
 	return 0
+}
+
+// Save the sessions to a file. Expects the mutex to be locked.
+func saveSessions() error {
+	file, err := os.OpenFile("state/qr2_sessions.gob", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+
+	encoder := gob.NewEncoder(file)
+	err = encoder.Encode(sessions)
+	file.Close()
+	return err
+}
+
+// Load the sessions from a file. Expects the mutex to be locked.
+func loadSessions() error {
+	file, err := os.Open("state/qr2_sessions.gob")
+	if err != nil {
+		return err
+	}
+
+	decoder := gob.NewDecoder(file)
+	err = decoder.Decode(&sessions)
+	file.Close()
+	if err != nil {
+		return err
+	}
+
+	for _, session := range sessions {
+		if session.SearchID != 0 {
+			sessionBySearchID[session.SearchID] = session
+		}
+
+		session.messageMutex = &deadlock.Mutex{}
+		session.messageAckWaker = &sleep.Waker{}
+		session.groupPointer = nil
+		session.login = nil
+	}
+
+	return nil
 }

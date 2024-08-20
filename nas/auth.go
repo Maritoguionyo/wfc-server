@@ -31,6 +31,19 @@ func handleAuthRequest(moduleName string, w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Need to know this here to determine UTF-16 endianness (LE for DS, BE for Wii)
+	// unitcd 0 = DS, 1 = Wii
+	unitcd := "1"
+	if unitcdValues, ok := r.PostForm["unitcd"]; ok {
+		unitcdDecoded, err := common.Base64DwcEncoding.DecodeString(unitcdValues[0])
+		if err != nil {
+			logging.Error(moduleName, "Invalid unitcd string in form")
+			replyHTTPError(w, 400, "400 Bad Request")
+			return
+		}
+		unitcd = string(unitcdDecoded)
+	}
+
 	fields := map[string]string{}
 	for key, values := range r.PostForm {
 		if len(values) != 1 {
@@ -38,22 +51,34 @@ func handleAuthRequest(moduleName string, w http.ResponseWriter, r *http.Request
 			continue
 		}
 
-		parsed, err := common.Base64DwcEncoding.DecodeString(values[0])
-		if err != nil {
-			logging.Error(moduleName, "Invalid POST form value:", aurora.Cyan(key).String()+":", aurora.Cyan(values[0]))
-			replyHTTPError(w, 400, "400 Bad Request")
-			return
-		}
-
-		value := string(parsed)
-
-		if key == "ingamesn" {
-			// Special handling required for the UTF-16 string
-			var utf16String []uint16
-			for i := 0; i < len(parsed)/2; i++ {
-				utf16String = append(utf16String, binary.BigEndian.Uint16(parsed[i*2:i*2+2]))
+		var value string
+		if !strings.HasPrefix(key, "_") {
+			parsed, err := common.Base64DwcEncoding.DecodeString(values[0])
+			if err != nil {
+				logging.Error(moduleName, "Invalid POST form value:", aurora.Cyan(key).String()+":", aurora.Cyan(values[0]))
+				replyHTTPError(w, 400, "400 Bad Request")
+				return
 			}
-			value = string(utf16.Decode(utf16String))
+
+			if key == "ingamesn" || key == "devname" || key == "words" {
+				// Special handling required for the UTF-16 string
+				var utf16String []uint16
+				if unitcd == "0" {
+					for i := 0; i < len(parsed)/2; i++ {
+						utf16String = append(utf16String, binary.LittleEndian.Uint16(parsed[i*2:i*2+2]))
+					}
+				} else {
+					for i := 0; i < len(parsed)/2; i++ {
+						utf16String = append(utf16String, binary.BigEndian.Uint16(parsed[i*2:i*2+2]))
+					}
+				}
+				value = string(utf16.Decode(utf16String))
+			} else {
+				value = string(parsed)
+			}
+		} else {
+			// Values unique to CTGP/the Wiimmfi payload, for compatibility reasons. Some of these are not base64 encoded.
+			value = values[0]
 		}
 
 		logging.Info(moduleName, aurora.Cyan(key).String()+":", aurora.Cyan(value))
@@ -71,7 +96,7 @@ func handleAuthRequest(moduleName string, w http.ResponseWriter, r *http.Request
 			return
 		}
 
-		switch action {
+		switch strings.ToLower(action) {
 		case "acctcreate":
 			reply = acctcreate()
 			break
@@ -117,7 +142,7 @@ func handleAuthRequest(moduleName string, w http.ResponseWriter, r *http.Request
 			return
 		}
 
-		switch action {
+		switch strings.ToLower(action) {
 		case "count":
 			response = []byte(dlsCount(fields))
 			break
@@ -195,30 +220,21 @@ func login(moduleName string, fields map[string]string, isLocalhost bool) map[st
 		return param
 	}
 
-	cfc, ok := fields["cfc"]
-	if !ok {
-		logging.Error(moduleName, "No cfc in form")
+	if (len(gsbrcd) < 4 && len(gsbrcd) != 0) || strings.ContainsRune(gsbrcd, 0) {
+		logging.Error(moduleName, "Invalid gsbrcd string in form")
 		param["returncd"] = "103"
 		return param
 	}
 
-	cfcInt, err := strconv.ParseUint(cfc, 10, 64)
-	if err != nil || cfcInt > 9999999999999999 {
-		logging.Error(moduleName, "Invalid cfc string in form")
-		param["returncd"] = "103"
-		return param
-	}
+	// Some games like Fortune Street make login requests without a gsbr code, so we temporarily fake one
+	if len(gsbrcd) == 0 {
+		if len(gamecd) < 4 {
+			logging.Error(moduleName, "Invalid gamecd string in form")
+			param["returncd"] = "103"
+			return param
+		}
 
-	region, ok := fields["region"]
-	if !ok {
-		region = "ff"
-	}
-
-	regionByte, err := hex.DecodeString(region)
-	if err != nil || len(regionByte) != 1 {
-		logging.Error(moduleName, "Invalid region byte in form")
-		param["returncd"] = "103"
-		return param
+		gsbrcd = gamecd[:3] + "J"
 	}
 
 	lang, ok := fields["lang"]
@@ -233,11 +249,89 @@ func login(moduleName string, fields map[string]string, isLocalhost bool) map[st
 		return param
 	}
 
-	authToken, challenge := common.MarshalNASAuthToken(gamecd, userId, gsbrcd, cfcInt, regionByte[0], langByte[0], fields["ingamesn"], isLocalhost)
+	unitcd, ok := fields["unitcd"]
+	if !ok {
+		logging.Error(moduleName, "No unitcd in form")
+		param["returncd"] = "103"
+		return param
+	}
 
-	param["returncd"] = "001"
+	unitcdInt, err := strconv.ParseUint(unitcd, 10, 64)
+	if err != nil || unitcdInt > 1 {
+		logging.Error(moduleName, "Invalid unitcd string in form")
+		param["returncd"] = "103"
+		return param
+	}
+
+	hasProfaneName := false
+	ingamesn, ok := fields["ingamesn"]
+	if ok {
+		if hasProfaneName, _ = IsBadWord(ingamesn); hasProfaneName {
+			logging.Info(moduleName, aurora.Cyan(strconv.FormatUint(userId, 10)), "has a profane name ("+aurora.Red(ingamesn).String()+")")
+		}
+	}
+
+	var authToken, challenge string
+	switch unitcdInt {
+	// ds
+	case 0:
+		devname, ok := fields["devname"]
+		if !ok {
+			logging.Error(moduleName, "No devname in form")
+			param["returncd"] = "103"
+			return param
+		}
+
+		// Only later DS games send this
+		ingamesn, ok := fields["ingamesn"]
+		if ok {
+			authToken, challenge = common.MarshalNASAuthToken(gamecd, userId, gsbrcd, 0, 0, langByte[0], ingamesn, 0, isLocalhost)
+			logging.Notice(moduleName, "Login (DS)", aurora.Cyan(strconv.FormatUint(userId, 10)), aurora.Cyan(gsbrcd), "devname:", aurora.Cyan(devname), "ingamesn:", aurora.Cyan(ingamesn))
+		} else {
+			authToken, challenge = common.MarshalNASAuthToken(gamecd, userId, gsbrcd, 0, 0, langByte[0], "", 0, isLocalhost)
+			logging.Notice(moduleName, "Login (DS)", aurora.Cyan(strconv.FormatUint(userId, 10)), aurora.Cyan(gsbrcd), "devname:", aurora.Cyan(devname))
+		}
+
+	// wii
+	case 1:
+		cfc, ok := fields["cfc"]
+		if !ok {
+			logging.Error(moduleName, "No cfc in form")
+			param["returncd"] = "103"
+			return param
+		}
+
+		cfcInt, err := strconv.ParseUint(cfc, 10, 64)
+		if err != nil || cfcInt > 9999999999999999 {
+			logging.Error(moduleName, "Invalid cfc string in form")
+			param["returncd"] = "103"
+			return param
+		}
+
+		region, ok := fields["region"]
+		if !ok {
+			region = "ff"
+		}
+
+		regionByte, err := hex.DecodeString(region)
+		if err != nil || len(regionByte) != 1 {
+			logging.Error(moduleName, "Invalid region byte in form")
+			param["returncd"] = "103"
+			return param
+		}
+
+		authToken, challenge = common.MarshalNASAuthToken(gamecd, userId, gsbrcd, cfcInt, regionByte[0], langByte[0], fields["ingamesn"], 1, isLocalhost)
+		logging.Notice(moduleName, "Login (Wii)", aurora.Cyan(strconv.FormatUint(userId, 10)), aurora.Cyan(gsbrcd), "ingamesn:", aurora.Cyan(fields["ingamesn"]))
+	}
+
+	if hasProfaneName {
+		param["returncd"] = "040"
+	} else {
+		param["returncd"] = "001"
+	}
 	param["challenge"] = challenge
 	param["token"] = authToken
+
 	return param
 }
 
@@ -272,14 +366,24 @@ func svcloc(fields map[string]string) map[string]string {
 }
 
 func handleProfanity(fields map[string]string) map[string]string {
-	prwords := ""
-	wordCount := strings.Count(fields["words"], "\t") + 1
-	for i := 0; i < wordCount; i++ {
-		prwords += "0"
+	var prwords string
+	for _, word := range strings.Split(fields["words"], "\t") {
+		if isBadWord, _ := IsBadWord(word); isBadWord {
+			prwords += "1"
+		} else {
+			prwords += "0"
+		}
+	}
+
+	var returncd string
+	if strings.Contains(prwords, "1") {
+		returncd = "040"
+	} else {
+		returncd = "000"
 	}
 
 	return map[string]string{
-		"returncd": "000",
+		"returncd": returncd,
 		"prwords":  prwords,
 	}
 }

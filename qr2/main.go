@@ -3,6 +3,7 @@ package qr2
 import (
 	"encoding/binary"
 	"net"
+	"sync"
 	"time"
 	"wwfc/common"
 	"wwfc/logging"
@@ -26,36 +27,108 @@ const (
 	ClientExploitReply = 0x10
 )
 
-var masterConn net.PacketConn
+var (
+	masterConn net.PacketConn
+	inShutdown = false
+	waitGroup  = sync.WaitGroup{}
+)
 
-func StartServer() {
+func StartServer(reload bool) {
 	// Get config
 	config := common.GetConfig()
 
-	address := config.Address + ":27900"
+	address := *config.GameSpyAddress + ":27900"
 	conn, err := net.ListenPacket("udp", address)
 	if err != nil {
 		panic(err)
 	}
 
 	masterConn = conn
+	inShutdown = false
 
-	// Close the listener when the application closes.
-	defer conn.Close()
-	logging.Notice("QR2", "Listening on", address)
-
-	for {
-		buf := make([]byte, 1024)
-		_, addr, err := conn.ReadFrom(buf)
+	if reload {
+		err := loadSessions()
 		if err != nil {
-			continue
+			panic(err)
 		}
 
-		go handleConnection(conn, addr, buf)
+		logging.Notice("QR2", "Loaded", aurora.Cyan(len(sessions)), "sessions")
+
+		err = loadLogins()
+		if err != nil {
+			panic(err)
+		}
+
+		logging.Notice("QR2", "Loaded", aurora.Cyan(len(logins)), "logins")
+
+		err = loadGroups()
+		if err != nil {
+			panic(err)
+		}
+
+		logging.Notice("QR2", "Loaded", aurora.Cyan(len(groups)), "groups")
 	}
+
+	waitGroup.Add(1)
+
+	go func() {
+		defer waitGroup.Done()
+
+		// Close the listener when the application closes.
+		defer conn.Close()
+		logging.Notice("QR2", "Listening on", aurora.BrightCyan(address))
+
+		for {
+			if inShutdown {
+				return
+			}
+
+			buf := make([]byte, 1024)
+			n, addr, err := conn.ReadFrom(buf)
+			if err != nil || n == 0 {
+				continue
+			}
+
+			waitGroup.Add(1)
+
+			go handleConnection(conn, *addr.(*net.UDPAddr), buf)
+		}
+	}()
 }
 
-func handleConnection(conn net.PacketConn, addr net.Addr, buffer []byte) {
+func Shutdown() {
+	inShutdown = true
+	masterConn.Close()
+	waitGroup.Wait()
+
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	err := saveSessions()
+	if err != nil {
+		logging.Error("QR2", "Failed to save sessions:", err)
+	}
+
+	logging.Notice("QR2", "Saved", aurora.Cyan(len(sessions)), "sessions")
+
+	err = saveLogins()
+	if err != nil {
+		logging.Error("QR2", "Failed to save logins:", err)
+	}
+
+	logging.Notice("QR2", "Saved", aurora.Cyan(len(logins)), "logins")
+
+	err = saveGroups()
+	if err != nil {
+		logging.Error("QR2", "Failed to save groups:", err)
+	}
+
+	logging.Notice("QR2", "Saved", aurora.Cyan(len(groups)), "groups")
+}
+
+func handleConnection(conn net.PacketConn, addr net.UDPAddr, buffer []byte) {
+	defer waitGroup.Done()
+
 	packetType := buffer[0]
 	moduleName := "QR2:" + addr.String()
 
@@ -78,11 +151,10 @@ func handleConnection(conn net.PacketConn, addr net.Addr, buffer []byte) {
 
 	switch packetType {
 	case QueryRequest:
-		logging.Notice(moduleName, "Command:", aurora.Yellow("QUERY"))
-		break
+		logging.Info(moduleName, "Command:", aurora.Yellow("QUERY"))
 
 	case ChallengeRequest:
-		logging.Notice(moduleName, "Command:", aurora.Yellow("CHALLENGE"))
+		logging.Info(moduleName, "Command:", aurora.Yellow("CHALLENGE"))
 
 		mutex.Lock()
 		if session.Challenge != "" {
@@ -90,62 +162,63 @@ func handleConnection(conn net.PacketConn, addr net.Addr, buffer []byte) {
 			session.Authenticated = true
 			mutex.Unlock()
 
-			conn.WriteTo(createResponseHeader(ClientRegisteredReply, session.SessionID), addr)
+			conn.WriteTo(createResponseHeader(ClientRegisteredReply, session.SessionID), &addr)
 		} else {
 			mutex.Unlock()
 		}
-		break
 
 	case EchoRequest:
-		logging.Notice(moduleName, "Command:", aurora.Yellow("ECHO"))
-		break
+		logging.Info(moduleName, "Command:", aurora.Yellow("ECHO"))
 
 	case HeartbeatRequest:
-		logging.Notice(moduleName, "Command:", aurora.Yellow("HEARTBEAT"))
+		// logging.Info(moduleName, "Command:", aurora.Yellow("HEARTBEAT"))
 		heartbeat(moduleName, conn, addr, buffer)
-		break
 
 	case AddErrorRequest:
-		logging.Notice(moduleName, "Command:", aurora.Yellow("ADDERROR"))
-		break
+		logging.Info(moduleName, "Command:", aurora.Yellow("ADDERROR"))
 
 	case EchoResponseRequest:
-		logging.Notice(moduleName, "Command:", aurora.Yellow("ECHO_RESPONSE"))
-		break
+		logging.Info(moduleName, "Command:", aurora.Yellow("ECHO_RESPONSE"))
 
 	case ClientMessageRequest:
-		logging.Notice(moduleName, "Command:", aurora.Yellow("CLIENT_MESSAGE"))
+		logging.Info(moduleName, "Command:", aurora.Yellow("CLIENT_MESSAGE"))
 		return
 
 	case ClientMessageAckRequest:
-		logging.Notice(moduleName, "Command:", aurora.Yellow("CLIENT_MESSAGE_ACK"))
+		// logging.Info(moduleName, "Command:", aurora.Yellow("CLIENT_MESSAGE_ACK"))
 
 		// In case ClientExploitReply is lost, this can be checked as well
 		// This would be sent either after the payload is downloaded, or the client is already patched
 		session.ExploitReceived = true
+		if login := session.login; login != nil {
+			login.NeedsExploit = false
+		}
+
+		session.messageAckWaker.Assert()
 		return
 
 	case KeepAliveRequest:
-		logging.Notice(moduleName, "Command:", aurora.Yellow("KEEPALIVE"))
-		mutex.Lock()
+		// logging.Info(moduleName, "Command:", aurora.Yellow("KEEPALIVE"))
+		conn.WriteTo(createResponseHeader(KeepAliveRequest, 0), &addr)
+
 		session.LastKeepAlive = time.Now().Unix()
-		mutex.Unlock()
 		return
 
 	case AvailableRequest:
-		logging.Notice("QR2", "Command:", aurora.Yellow("AVAILABLE"))
-		conn.WriteTo(createResponseHeader(AvailableRequest, 0), addr)
+		logging.Info("QR2", "Command:", aurora.Yellow("AVAILABLE"))
+		conn.WriteTo(createResponseHeader(AvailableRequest, 0), &addr)
 		return
 
 	case ClientRegisteredReply:
-		logging.Notice(moduleName, "Command:", aurora.Yellow("CLIENT_REGISTERED"))
-		break
+		logging.Info(moduleName, "Command:", aurora.Yellow("CLIENT_REGISTERED"))
 
 	case ClientExploitReply:
-		logging.Notice(moduleName, "Command:", aurora.Yellow("CLIENT_EXPLOIT_ACK"))
+		logging.Info(moduleName, "Command:", aurora.Yellow("CLIENT_EXPLOIT_ACK"))
 
 		session.ExploitReceived = true
-		break
+		if login := session.login; login != nil {
+			login.NeedsExploit = false
+		}
 
 	default:
 		logging.Error(moduleName, "Unknown command:", aurora.Yellow(buffer[0]))

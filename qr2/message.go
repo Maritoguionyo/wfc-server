@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 	"wwfc/common"
 	"wwfc/logging"
 
 	"github.com/logrusorgru/aurora/v3"
+	"gvisor.dev/gvisor/pkg/sleep"
 )
 
 func printHex(data []byte) string {
@@ -31,7 +34,6 @@ func SendClientMessage(senderIP string, destSearchID uint64, message []byte) {
 	var matchData common.MatchCommandData
 	var sender *Session
 	var receiver *Session
-	senderIPInt, _ := common.IPFormatToInt(senderIP)
 
 	useSearchID := destSearchID < (1 << 24)
 	if useSearchID {
@@ -51,7 +53,7 @@ func SendClientMessage(senderIP string, destSearchID uint64, message []byte) {
 		return
 	}
 
-	if receiver.Login == nil || !receiver.Login.DeviceAuthenticated {
+	if receiver.login == nil || !receiver.login.DeviceAuthenticated {
 		logging.Error(moduleName, "Destination", aurora.Cyan(destSearchID), "is not device authenticated")
 	}
 
@@ -91,26 +93,29 @@ func SendClientMessage(senderIP string, destSearchID uint64, message []byte) {
 		qr2IP := binary.BigEndian.Uint32(message[0x0C:0x10])
 		qr2Port := binary.LittleEndian.Uint16(message[0x0A:0x0C])
 
-		if senderIPInt != int32(qr2IP) {
-			logging.Error(moduleName, "Wrong QR2 IP in match command packet header")
-			return
-		}
-
 		sender = sessions[(uint64(qr2Port)<<32)|uint64(qr2IP)]
 		if sender == nil || !sender.Authenticated {
 			logging.Error(moduleName, "Session does not exist with QR2 IP and port")
 			return
 		}
 
-		if !sender.setProfileID(moduleName, strconv.FormatUint(uint64(senderProfileID), 10)) {
+		if !sender.setProfileID(moduleName, strconv.FormatUint(uint64(senderProfileID), 10), strings.Split(senderIP, ":")[0]) {
 			// Error already logged
 			return
 		}
 
-		if sender.Login == nil || !sender.Login.DeviceAuthenticated {
+		if sender.login == nil || !sender.login.DeviceAuthenticated {
 			logging.Error(moduleName, "Sender is not device authenticated")
 			return
 		}
+
+		mutex.Lock()
+		if sender.Data["gamename"] != receiver.Data["gamename"] {
+			mutex.Unlock()
+			logging.Error(moduleName, "Sender and receiver are not playing the same game")
+			return
+		}
+		mutex.Unlock()
 
 		var ok bool
 		matchData, ok = common.DecodeMatchCommand(message[8], message[0x14:], version)
@@ -120,12 +125,6 @@ func SendClientMessage(senderIP string, destSearchID uint64, message []byte) {
 		}
 
 		if message[8] == common.MatchReservation {
-			if matchData.Reservation.MatchType == 3 {
-				// TODO: Check that this is correct
-				logging.Error(moduleName, "RESERVATION: Attempt to join a private room over ServerBrowser")
-				return
-			}
-
 			if matchData.Reservation.HasPublicIP {
 				if qr2IP != matchData.Reservation.PublicIP {
 					logging.Error(moduleName, "RESERVATION: Public IP mismatch in header and command")
@@ -209,7 +208,7 @@ func SendClientMessage(senderIP string, destSearchID uint64, message []byte) {
 		}
 
 		var matchMessage []byte
-		matchMessage, ok = common.EncodeMatchCommand(message[8], matchData, version)
+		matchMessage, ok = common.EncodeMatchCommand(message[8], matchData)
 		if !ok || len(matchMessage) > 0x80 {
 			logging.Error(moduleName, "Failed to reencode match command:", aurora.Cyan(printHex(message)))
 			return
@@ -222,45 +221,7 @@ func SendClientMessage(senderIP string, destSearchID uint64, message []byte) {
 		logging.Error(moduleName, "Invalid message:", aurora.Cyan(printHex(message)))
 	}
 
-	mutex.Lock()
-
-	destPid, ok := receiver.Data["dwc_pid"]
-	if !ok || destPid == "" {
-		destPid = "<UNKNOWN>"
-	}
-
-	destSessionID := receiver.SessionID
-	packetCount := receiver.PacketCount + 1
-	receiver.PacketCount = packetCount
-	destAddr := receiver.Addr
-
-	mutex.Unlock()
-
-	if isNatnegPacket {
-		cookie := binary.BigEndian.Uint32(message[0x2:0x6])
-		logging.Notice(moduleName, "Send NN cookie", aurora.Cyan(cookie), "to", aurora.BrightCyan(destPid))
-	} else {
-		cmd := message[8]
-		common.LogMatchCommand(moduleName, destPid, cmd, matchData)
-
-		if cmd == common.MatchReservation {
-			sender.ReservationID = receiver.SearchID
-		} else if cmd == common.MatchResvOK || cmd == common.MatchResvDeny || cmd == common.MatchResvWait {
-			if receiver.ReservationID != sender.SearchID {
-				logging.Error(moduleName, "Destination has no reservation with the sender")
-				return
-			}
-
-			if cmd == common.MatchResvOK {
-				mutex.Lock()
-				if !processResvOK(moduleName, *matchData.ResvOK, sender, receiver) {
-					mutex.Unlock()
-					return
-				}
-				mutex.Unlock()
-			}
-		}
-	}
+	destSessionID, packetCount, destAddr := processClientMessage(moduleName, sender, receiver, message, isNatnegPacket, matchData)
 
 	payload := createResponseHeader(ClientMessageRequest, destSessionID)
 
@@ -268,21 +229,144 @@ func SendClientMessage(senderIP string, destSearchID uint64, message []byte) {
 	binary.BigEndian.PutUint32(payload[len(payload)-4:], packetCount)
 	payload = append(payload, message...)
 
-	_, err := masterConn.WriteTo(payload, destAddr)
-	if err != nil {
-		logging.Error(moduleName, "Error sending message:", err.Error())
-	}
-}
+	receiver.messageMutex.Lock()
+	defer receiver.messageMutex.Unlock()
 
-func sendClientExploit(moduleName string, sessionCopy Session) {
-	if len(sessionCopy.Login.GameCode) != 4 || !common.IsUppercaseAlphanumeric(sessionCopy.Login.GameCode) {
-		logging.Error(moduleName, "Invalid game code:", aurora.Cyan(sessionCopy.Login.GameCode))
+	if receiver.login == nil {
 		return
 	}
 
-	exploit, err := os.ReadFile("payload/sbcm/" + "payload." + sessionCopy.Login.GameCode + ".bin")
+	s := sleep.Sleeper{}
+	defer s.Done()
+
+	receiver.messageAckWaker.Clear()
+	s.AddWaker(receiver.messageAckWaker)
+
+	timeWaker := sleep.Waker{}
+	s.AddWaker(&timeWaker)
+
+	timeOutCount := 0
+	for {
+		time.AfterFunc(1*time.Second, func() {
+			timeWaker.Assert()
+		})
+
+		_, err := masterConn.WriteTo(payload, &destAddr)
+		if err != nil {
+			logging.Error(moduleName, "Error sending message:", err.Error())
+		}
+
+		// Wait for an ack or timeout
+		switch s.Fetch(true) {
+		case &timeWaker:
+			timeOutCount++
+
+			// Enforce a 10 second timeout
+			if timeOutCount <= 10 {
+				break
+			}
+
+			logging.Error(moduleName, "Timed out waiting for ack")
+			// Kick the player
+			if login := receiver.login; login != nil {
+				gpErrorCallback(login.ProfileID, "network_error")
+				receiver.login = nil
+			}
+			return
+
+		default:
+			return
+		}
+	}
+}
+
+func processClientMessage(moduleName string, sender, receiver *Session, message []byte, isNatnegPacket bool, matchData common.MatchCommandData) (destSessionID uint32, packetCount uint32, destAddr net.UDPAddr) {
+	mutex.Lock()
+
+	destPid, ok := receiver.Data["dwc_pid"]
+	if !ok || destPid == "" {
+		destPid = "<UNKNOWN>"
+	}
+
+	destSessionID = receiver.SessionID
+	packetCount = receiver.PacketCount + 1
+	receiver.PacketCount = packetCount
+	destAddr = receiver.Addr
+
+	if isNatnegPacket {
+		mutex.Unlock()
+		cookie := binary.BigEndian.Uint32(message[0x6:0xA])
+		logging.Notice(moduleName, "Send NN cookie", aurora.Cyan(strconv.FormatUint(uint64(cookie), 16)), "to", aurora.BrightCyan(destPid))
+		return
+	}
+	defer mutex.Unlock()
+
+	cmd := message[8]
+	common.LogMatchCommand(moduleName, destPid, cmd, matchData)
+
+	if cmd == common.MatchReservation {
+		resvError := checkReservationAllowed(moduleName, sender, receiver, matchData.Reservation.MatchType)
+		if resvError != "ok" {
+			if resvError == "restricted" || resvError == "restricted_join" {
+				logging.Error(moduleName, "RESERVATION: Restricted player attempted to join a public match")
+
+				if sender.login != nil && sender.login.Restricted {
+					profileId := sender.login.ProfileID
+
+					mutex.Unlock()
+					gpErrorCallback(profileId, resvError)
+					mutex.Lock()
+				}
+				if receiver.login != nil && receiver.login.Restricted {
+					profileId := receiver.login.ProfileID
+
+					mutex.Unlock()
+					gpErrorCallback(profileId, resvError)
+					mutex.Lock()
+				}
+			}
+			return
+		}
+
+		sender.Reservation = matchData
+		sender.ReservationID = receiver.SearchID
+	} else if cmd == common.MatchResvOK || cmd == common.MatchResvDeny || cmd == common.MatchResvWait {
+		if receiver.ReservationID != sender.SearchID || receiver.Reservation.Reservation == nil {
+			logging.Warn(moduleName, "Destination has no reservation with the sender")
+			if receiver.groupPointer == nil || receiver.groupPointer != sender.groupPointer {
+				return
+			}
+			// Allow the message through anyway to avoid a room deadlock
+		}
+
+		if receiver.Reservation.Version != matchData.Version {
+			logging.Error(moduleName, "Reservation version mismatch")
+			return
+		}
+
+		if cmd == common.MatchResvOK {
+			if !processResvOK(moduleName, matchData.Version, *receiver.Reservation.Reservation, *matchData.ResvOK, sender, receiver) {
+				return
+			}
+		} else if receiver.ReservationID == sender.SearchID {
+			receiver.ReservationID = 0
+		}
+	} else if cmd == common.MatchTellAddr {
+		processTellAddr(moduleName, sender, receiver)
+	}
+
+	return
+}
+
+func sendClientExploit(moduleName string, sessionCopy Session) {
+	if len(sessionCopy.login.GameCode) != 4 || !common.IsUppercaseAlphanumeric(sessionCopy.login.GameCode) {
+		logging.Error(moduleName, "Invalid game code:", aurora.Cyan(sessionCopy.login.GameCode))
+		return
+	}
+
+	exploit, err := os.ReadFile("payload/sbcm/" + "payload." + sessionCopy.login.GameCode + ".bin")
 	if err != nil {
-		logging.Error(moduleName, "Error reading exploit file", aurora.Cyan(sessionCopy.Login.GameCode), "-", err.Error())
+		logging.Error(moduleName, "Error reading exploit file", aurora.Cyan(sessionCopy.login.GameCode), "-", err.Error())
 		return
 	}
 
@@ -306,7 +390,7 @@ func sendClientExploit(moduleName string, sessionCopy Session) {
 
 	go func() {
 		for {
-			_, err = masterConn.WriteTo(payload, sessionCopy.Addr)
+			_, err = masterConn.WriteTo(payload, &sessionCopy.Addr)
 			if err != nil {
 				logging.Error(moduleName, "Error sending message:", err.Error())
 			}
@@ -316,7 +400,7 @@ func sendClientExploit(moduleName string, sessionCopy Session) {
 
 			mutex.Lock()
 			session, sessionExists := sessions[makeLookupAddr(sessionCopy.Addr.String())]
-			if !sessionExists || session.ExploitReceived || session.Login == nil || !session.Login.NeedsExploit {
+			if !sessionExists || session.ExploitReceived || session.login == nil || !session.login.NeedsExploit {
 				mutex.Unlock()
 				return
 			}
